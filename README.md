@@ -5,11 +5,11 @@
 
 ```
  GitDeck  14:05
-▶git-test         alexsunder   main     ↓2 ✎1
- nolink           alexsunder   main     ? ветка не связана
- proj             some-org     main     ↑1
- Сервис заметок   —            main     ⌂ нет на GitHub
- Enter перейти · r обновить · q закрыть
+▶git-test       ↓2 ✎1  main · alexsunder
+ nolink         ? не связан  main · alexsunder
+ proj           ↑1  main · some-org
+ Сервис заметок ⌂ локальный  main
+ Enter перейти · r обновить · q скрыть
 ```
 
 | Значок | Значит |
@@ -19,8 +19,8 @@
 | `✎N` | N файлов изменены, не закоммичены |
 | `✓` | всё синхронно |
 | `▶` | текущий репозиторий (где сейчас nvim) |
-| `⌂ нет на GitHub` | репозиторий только локальный |
-| `? ветка не связана` | GitHub есть, но ветка не связана (`git push -u origin main`) |
+| `⌂ локальный` | репозиторий только на компьютере, на GitHub его нет |
+| `? не связан` | GitHub есть, но ветка не связана с ним (`git push -u origin main`) |
 
 Репозитории находятся сами: папки из списка `dirs` и их подпапки первого уровня, где есть `.git`.
 Склонировал (`gh repo clone`) или создал (`git init`, `gh repo create`) — появится после обновления.
@@ -39,7 +39,7 @@ require("gitdeck").setup({
   dirs = { "~/git-test", "~/Documents/Сервисы", "~/Documents/Projects" },
   interval = 5,          -- минут между автообновлениями
   fetch = true,          -- спрашивать GitHub о новом (git fetch)
-  height = 10,           -- высота панели
+  max_height = 15,       -- наибольшая высота панели (подстраивается под число репозиториев)
   open_on_start = true,  -- открывать при запуске nvim
 })
 EOF
@@ -53,7 +53,7 @@ EOF
 | `:GitDeckRefresh` | обновить сейчас |
 | `:GitDeckClose` | закрыть панель |
 | `Enter` (в панели) | перейти в репозиторий (nvim и дерево) |
-| `r` / `q` (в панели) | обновить / закрыть |
+| `r` / `q` (в панели) | обновить / скрыть |
 
 С auto-session: добавить `"GitDeckClose"` в `pre_save_cmds`, чтобы панель не попадала в сессию.
 

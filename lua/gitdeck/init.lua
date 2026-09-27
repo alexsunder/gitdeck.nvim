@@ -5,7 +5,7 @@ M.config = {
   dirs = { "~/git-test", "~/Documents/Сервисы", "~/Documents/Projects" }, -- где искать
   interval = 5,          -- минут между автообновлениями
   fetch = true,          -- спрашивать GitHub о новом (git fetch)
-  height = 10,           -- высота панели под деревом
+  max_height = 15,       -- наибольшая высота панели (подстраивается под число репозиториев)
   open_on_start = false, -- открывать панель при запуске nvim
 }
 
@@ -98,8 +98,8 @@ end
 -- сегменты статуса: { текст, группа подсветки }
 local function status_parts(r)
   if not r then return { { "…", "Comment" } } end
-  if not r.url then return { { "⌂ нет на GitHub", "DiagnosticWarn" } } end
-  if not r.ahead then return { { "? ветка не связана", "DiagnosticWarn" } } end
+  if not r.url then return { { "⌂ локальный", "DiagnosticWarn" } } end
+  if not r.ahead then return { { "? не связан", "DiagnosticWarn" } } end
   local p = {}
   if r.behind > 0 then table.insert(p, { "↓" .. r.behind, "DiagnosticInfo" }) end
   if r.ahead > 0 then table.insert(p, { "↑" .. r.ahead, "DiagnosticWarn" }) end
@@ -125,21 +125,27 @@ local function render()
   for _, path in ipairs(st.list or {}) do
     local r = st.rows[path]
     local here = is_current(path)
+    local width = (M.is_open() and vim.api.nvim_win_get_width(st.win)) or 40
+    local status, stw = {}, 0
+    for i, seg in ipairs(status_parts(r)) do
+      if i > 1 then table.insert(status, { " " }); stw = stw + 1 end
+      table.insert(status, seg)
+      stw = stw + vim.fn.strdisplaywidth(seg[1])
+    end
+    local namew = math.max(8, math.min(18, width - 2 - math.max(stw, 6) - 2))
     local parts = {
       { here and "▶" or " ", "Title" },
-      { fit(vim.fs.basename(path), 16) .. " ", here and "Title" or "Directory" },
-      { fit(r and (r.owner or "—") or "", 12) .. " ", "Comment" },
-      { fit(r and r.branch or "", 8) .. " ", "Identifier" },
+      { fit(vim.fs.basename(path), namew) .. " ", here and "Title" or "Directory" },
     }
-    for i, seg in ipairs(status_parts(r)) do
-      if i > 1 then table.insert(parts, { " " }) end
-      table.insert(parts, seg)
-    end
+    vim.list_extend(parts, status)
+    -- ветка и владелец — мельче, в конце строки (обрежутся, если не влезут)
+    local extra = "  " .. (r and r.branch or "") .. (r and r.owner and (" · " .. r.owner) or "")
+    table.insert(parts, { extra, "Comment" })
     add(parts)
     st.paths[#lines] = path
   end
   if #(st.list or {}) == 0 then add({ { " (репозиториев не найдено)", "Comment" } }) end
-  add({ { " Enter перейти · r обновить · q закрыть", "Comment" } })
+  add({ { " Enter перейти · r обновить · q скрыть", "Comment" } })
 
   vim.bo[st.buf].modifiable = true
   vim.api.nvim_buf_set_lines(st.buf, 0, -1, false, lines)
@@ -147,6 +153,16 @@ local function render()
   vim.api.nvim_buf_clear_namespace(st.buf, ns, 0, -1)
   for _, h in ipairs(hls) do
     vim.api.nvim_buf_set_extmark(st.buf, ns, h[1], h[2], { end_col = h[3], hl_group = h[4] })
+  end
+  M.fix_height()
+end
+
+-- высота панели = число строк (не больше max_height), без пустых хвостов
+function M.fix_height()
+  if not M.is_open() or not (st.buf and vim.api.nvim_buf_is_valid(st.buf)) then return end
+  local want = math.min(vim.api.nvim_buf_line_count(st.buf), M.config.max_height)
+  if vim.api.nvim_win_get_height(st.win) ~= want then
+    pcall(vim.api.nvim_win_set_height, st.win, want)
   end
 end
 
@@ -208,7 +224,7 @@ function M.open()
   local tree = nerdtree_win()
   if tree then
     vim.api.nvim_set_current_win(tree)
-    vim.cmd("belowright " .. M.config.height .. "split")
+    vim.cmd("belowright 5split")
     st.win = vim.api.nvim_get_current_win()
   else
     vim.cmd("topleft 45vsplit")
@@ -271,6 +287,11 @@ ensure_init = function()
   local g = vim.api.nvim_create_augroup("gitdeck_nvim", { clear = true })
   -- сменилась папка nvim → перерисовать отметку текущего репозитория
   vim.api.nvim_create_autocmd("DirChanged", { group = g, callback = function() render() end })
+  -- открыли/закрыли терминал или другое окно → вернуть панели её высоту
+  vim.api.nvim_create_autocmd({ "WinResized", "WinClosed", "WinNew", "VimResized" }, {
+    group = g,
+    callback = function() vim.schedule(M.fix_height) end,
+  })
   -- при выходе: если остались только служебные окна — убрать панель,
   -- чтобы nvim закрывался как обычно
   vim.api.nvim_create_autocmd("QuitPre", {
