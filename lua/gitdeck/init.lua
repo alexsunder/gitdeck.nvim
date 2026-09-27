@@ -120,7 +120,7 @@ local function render()
     end
     table.insert(lines, text)
   end
-  add({ { " GitDeck", "Title" }, { st.updated and ("  " .. st.updated) or "  …", "Comment" } })
+  add({ { " GitDeck", "Keyword" }, { st.updated and ("  " .. st.updated) or "  …", "Comment" } })
   st.paths = {}
   for _, path in ipairs(st.list or {}) do
     local r = st.rows[path]
@@ -132,20 +132,18 @@ local function render()
       table.insert(status, seg)
       stw = stw + vim.fn.strdisplaywidth(seg[1])
     end
-    local namew = math.max(8, math.min(18, width - 2 - math.max(stw, 6) - 2))
+    local namew = math.max(8, math.min(22, width - 2 - math.max(stw, 6) - 1))
     local parts = {
       { here and "▶" or " ", "Title" },
       { fit(vim.fs.basename(path), namew) .. " ", here and "Title" or "Directory" },
     }
     vim.list_extend(parts, status)
-    -- ветка и владелец — мельче, в конце строки (обрежутся, если не влезут)
-    local extra = "  " .. (r and r.branch or "") .. (r and r.owner and (" · " .. r.owner) or "")
-    table.insert(parts, { extra, "Comment" })
     add(parts)
     st.paths[#lines] = path
   end
   if #(st.list or {}) == 0 then add({ { " (репозиториев не найдено)", "Comment" } }) end
   add({ { " Enter перейти · r обновить · q скрыть", "Comment" } })
+  add({ { "" } })
 
   vim.bo[st.buf].modifiable = true
   vim.api.nvim_buf_set_lines(st.buf, 0, -1, false, lines)

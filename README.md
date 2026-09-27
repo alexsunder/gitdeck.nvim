@@ -5,10 +5,10 @@
 
 ```
  GitDeck  14:05
-▶git-test       ↓2 ✎1  main · alexsunder
- nolink         ? не связан  main · alexsunder
- proj           ↑1  main · some-org
- Сервис заметок ⌂ локальный  main
+▶git-test           ↓2 ✎1
+ nolink             ? не связан
+ proj               ↑1
+ Сервис заметок     ⌂ локальный
  Enter перейти · r обновить · q скрыть
 ```
 
