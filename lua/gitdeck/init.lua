@@ -5,13 +5,14 @@ M.config = {
   dirs = { "~/git-test", "~/Documents/Сервисы", "~/Documents/Projects" }, -- где искать
   interval = 5,          -- минут между автообновлениями
   fetch = true,          -- спрашивать GitHub о новом (git fetch)
+  retry = 30,           -- секунд до повторной проверки, если GitHub не ответил
   max_height = 15,       -- наибольшая высота панели (подстраивается под число репозиториев)
   open_on_start = false, -- открывать панель при запуске nvim
 }
 
 local ns = vim.api.nvim_create_namespace("gitdeck")
 local ensure_init -- объявлена ниже
-local st = { buf = nil, win = nil, rows = {}, paths = {}, updated = nil, timer = nil, busy = false, inited = false }
+local st = { retry = {}, buf = nil, win = nil, rows = {}, paths = {}, updated = nil, timer = nil, busy = false, inited = false }
 
 -- ---------- поиск репозиториев ----------
 local function expand(p)
@@ -56,6 +57,7 @@ r=$(git remote 2>/dev/null | head -n1)
 echo "branch=$(git branch --show-current 2>/dev/null)"
 echo "ab=$(git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null)"
 echo "dirty=$(git status --porcelain 2>/dev/null | wc -l)"
+echo "ok=1"
 ]]
 
 local function parse(out)
@@ -64,6 +66,7 @@ local function parse(out)
     local k, v = line:match("^(%w+)=(.*)$")
     if k then s[k] = vim.trim(v) end
   end
+  if s.ok ~= "1" then return { failed = true } end
   local r = { branch = s.branch ~= "" and s.branch or "?", dirty = tonumber(s.dirty) or 0 }
   r.url = s.url and s.url ~= "" and s.url or nil
   if r.url then
@@ -75,7 +78,10 @@ local function parse(out)
 end
 
 local function check(path, cb)
-  local fetch = M.config.fetch and "git fetch --quiet >/dev/null 2>&1" or ""
+  -- fetch не дольше ~15 с при плохой сети, чтобы не держать проверку
+  local fetch = M.config.fetch
+    and "git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 fetch --quiet >/dev/null 2>&1"
+    or ""
   vim.system({ "sh", "-c", SCRIPT:format(fetch) },
     { cwd = path, text = true, env = { GIT_TERMINAL_PROMPT = "0" }, timeout = 30000 },
     function(res) cb(parse(res.stdout)) end)
@@ -98,6 +104,7 @@ end
 -- сегменты статуса: { текст, группа подсветки }
 local function status_parts(r)
   if not r then return { { "…", "Comment" } } end
+  if r.failed then return { { "…", "Comment" } } end
   if not r.url then return { { "⌂ локальный", "DiagnosticWarn" } } end
   if not r.ahead then return { { "? не связан", "DiagnosticWarn" } } end
   local p = {}
@@ -171,6 +178,23 @@ function M.fix_height()
 end
 
 -- ---------- обновление ----------
+-- не ответил → проверять этот репозиторий снова каждые retry секунд,
+-- пока не придёт верный статус
+local function schedule_retry(path)
+  if st.retry[path] then return end
+  st.retry[path] = true
+  vim.defer_fn(function()
+    st.retry[path] = nil
+    check(path, function(r)
+      vim.schedule(function()
+        st.rows[path] = r
+        render()
+        if r.failed then schedule_retry(path) end
+      end)
+    end)
+  end, M.config.retry * 1000)
+end
+
 function M.refresh()
   if st.busy then return end
   st.busy = true
@@ -186,6 +210,7 @@ function M.refresh()
     check(path, function(r)
       vim.schedule(function()
         st.rows[path] = r
+        if r.failed then schedule_retry(path) end
         left = left - 1
         if left == 0 then
           st.busy = false
@@ -291,6 +316,11 @@ ensure_init = function()
   local g = vim.api.nvim_create_augroup("gitdeck_nvim", { clear = true })
   -- сменилась папка nvim → перерисовать отметку текущего репозитория
   vim.api.nvim_create_autocmd("DirChanged", { group = g, callback = function() render() end })
+  -- после git-команд fugitive, закрытия lazygit/терминала и возврата в окно
+  -- терминала → обновить статусы сразу, не дожидаясь таймера
+  local function soon() vim.defer_fn(M.refresh, 300) end
+  vim.api.nvim_create_autocmd("User", { group = g, pattern = "FugitiveChanged", callback = soon })
+  vim.api.nvim_create_autocmd({ "TermClose", "FocusGained" }, { group = g, callback = soon })
   -- открыли/закрыли терминал или другое окно → вернуть панели её высоту
   vim.api.nvim_create_autocmd({ "WinResized", "WinClosed", "WinNew", "VimResized" }, {
     group = g,
