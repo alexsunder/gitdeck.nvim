@@ -158,6 +158,12 @@ end
 -- высота панели = число строк (не больше max_height), без пустых хвостов
 function M.fix_height()
   if not M.is_open() or not (st.buf and vim.api.nvim_buf_is_valid(st.buf)) then return end
+  -- менять высоту, только если над панелью есть окно (дерево).
+  -- Если панель одна в колонке, лишнее место ушло бы в командную строку.
+  local has_above = vim.api.nvim_win_call(st.win, function()
+    return vim.fn.winnr("k") ~= vim.fn.winnr()
+  end)
+  if not has_above then return end
   local want = math.min(vim.api.nvim_buf_line_count(st.buf), M.config.max_height)
   if vim.api.nvim_win_get_height(st.win) ~= want then
     pcall(vim.api.nvim_win_set_height, st.win, want)
