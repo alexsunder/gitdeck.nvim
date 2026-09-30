@@ -157,7 +157,7 @@ end
 local function status_parts(r)
   if not r then return { { "…", "Comment" } } end
   if r.failed then return { { "…", "Comment" } } end
-  if not r.url then return { { "⌂ локальный", "DiagnosticWarn" } } end
+  if not r.url then return { { "⌂", "DiagnosticWarn" } } end
   if not r.ahead then return { { "? не связан", "DiagnosticWarn" } } end
   local p = {}
   if r.behind > 0 then table.insert(p, { "↓" .. r.behind, "DiagnosticInfo" }) end
@@ -328,6 +328,8 @@ function M.open()
   local wo = vim.wo[st.win]
   wo.number, wo.relativenumber, wo.wrap = false, false, false
   wo.signcolumn, wo.cursorline, wo.winfixheight = "no", true, true
+  -- подсвечивать всю строку под курсором (в init.vim может стоять cursorlineopt=number)
+  wo.cursorlineopt = "line"
   if vim.api.nvim_win_is_valid(back) then vim.api.nvim_set_current_win(back) end
   M.refresh()
 end
@@ -424,7 +426,8 @@ local function set_draw(title, rows, cursor)
     local text = row[1]
     lines[i] = text
     width = math.max(width, vim.fn.strdisplaywidth(text) + 2)
-    if row[2] and #text > 0 then table.insert(hls, { i - 1, #text, row[2] }) end
+    if row[2] and #text > 0 then table.insert(hls, { i - 1, 0, #text, row[2] }) end
+    for _, seg in ipairs(row[4] or {}) do table.insert(hls, { i - 1, seg[1], seg[2], seg[3] }) end
     if row[3] then set.items[i] = row[3] end
   end
   width = math.min(width, vim.o.columns - 4)
@@ -447,7 +450,7 @@ local function set_draw(title, rows, cursor)
   vim.bo[set.buf].modifiable = false
   vim.api.nvim_buf_clear_namespace(set.buf, ns, 0, -1)
   for _, h in ipairs(hls) do
-    vim.api.nvim_buf_set_extmark(set.buf, ns, h[1], 0, { end_col = h[2], hl_group = h[3] })
+    vim.api.nvim_buf_set_extmark(set.buf, ns, h[1], h[2], { end_col = h[3], hl_group = h[4] })
   end
   local cfg = {
     relative = "editor", style = "minimal", border = "rounded",
@@ -461,6 +464,7 @@ local function set_draw(title, rows, cursor)
   else
     set.win = vim.api.nvim_open_win(set.buf, true, cfg)
     vim.wo[set.win].cursorline = true
+    vim.wo[set.win].cursorlineopt = "line"
   end
   -- курсор на первую строку с действием (или на заданную)
   local first = cursor
@@ -488,6 +492,21 @@ local function page_repos(cursor_path)
   table.insert(rows, { "  ⏱ Проверять каждые: " .. interval() .. " мин", nil, { interval = true } })
   table.insert(rows, { "" })
   table.insert(rows, { " Enter выбрать · a добавить · d убрать · q закрыть", "Comment" })
+  table.insert(rows, { "" })
+  table.insert(rows, { " Значки", "Title" })
+  for _, l in ipairs({
+    { "↓N", "DiagnosticInfo", "на GitHub N новых коммитов — забрать (pull)" },
+    { "↑N", "DiagnosticWarn", "N коммитов не отправлены — отправить (push)" },
+    { "✎N", "DiagnosticHint", "N файлов изменены, не закоммичены" },
+    { "✓ ", "DiagnosticOk", "всё синхронно" },
+    { "⌂ ", "DiagnosticWarn", "только на компьютере, на GitHub нет" },
+    { "? ", "DiagnosticWarn", "ветка не связана с GitHub" },
+    { "… ", "Comment", "идёт проверка" },
+    { "▶ ", "Title", "текущий репозиторий" },
+    { "()", "Comment", "отслеживаемая ветка" },
+  }) do
+    table.insert(rows, { "  " .. l[1] .. "  " .. l[3], nil, nil, { { 2, 2 + #l[1], l[2] } } })
+  end
   set_draw("GitDeck · настройки", rows, cursor)
 end
 
@@ -595,10 +614,10 @@ function M._set_action(kind)
   end
 end
 
--- открыть настройки; path — репозиторий под курсором в панели (если есть)
+-- открыть настройки (список); курсор — на репозитории path, если он задан
 function M.settings(path)
   ensure_init()
-  if path then page_repo(path) else page_repos() end
+  page_repos(path)
 end
 
 -- состояние текущего репозитория строкой (для lualine, по желанию)
