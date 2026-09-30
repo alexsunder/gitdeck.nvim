@@ -410,16 +410,143 @@ local function branches(path)
   return list
 end
 
-local set = { buf = nil, win = nil, page = "repos", repo = nil, items = {} }
-local set_interval -- объявлена ниже
-
-local function set_close()
-  if set.win and vim.api.nvim_win_is_valid(set.win) then vim.api.nvim_win_close(set.win, true) end
-  set.win = nil
+local function current_branch(path)
+  local res = vim.system({ "git", "branch", "--show-current" }, { cwd = path, text = true }):wait()
+  local b = vim.trim(res.stdout or "")
+  return b ~= "" and b or nil
 end
 
--- нарисовать страницу: lines = { {текст, группа}, … }, items[номер строки] = действие
-local function set_draw(title, rows, cursor)
+-- Окно настроек. Строка страницы: { текст, подсветка, действие, куски подсветки }.
+-- действие = { act = функция по Enter/клику, zones = { {начало, конец, функция}, … } }
+-- (начало/конец — байты в строке: клик или Enter на этом месте вызывает функцию зоны).
+-- Поля ввода — маленькие окна поверх строки окна настроек: ввод прямо в окне,
+-- без командной строки.
+local set = {
+  buf = nil, win = nil, page = "repos", repo = nil, dir = nil,
+  items = {}, fields = {}, msg = nil,
+  val = { path = nil, interval = nil },
+}
+local page_repos, page_repo, page_browse -- объявлены ниже
+
+vim.api.nvim_set_hl(0, "GitDeckField", { default = true, link = "Visual" })
+
+local function ours(win)
+  if win == set.win then return true end
+  for _, f in pairs(set.fields) do
+    if f.win == win then return true end
+  end
+  return false
+end
+
+local function close_fields()
+  for _, f in pairs(set.fields) do
+    if f.win and vim.api.nvim_win_is_valid(f.win) then vim.api.nvim_win_close(f.win, true) end
+  end
+  set.fields = {}
+end
+
+local function set_close()
+  close_fields()
+  if set.win and vim.api.nvim_win_is_valid(set.win) then vim.api.nvim_win_close(set.win, true) end
+  set.win = nil
+  set.msg = nil
+end
+
+-- ушли из окна настроек (и его полей) в другое окно → закрыть всё
+local function leave_check()
+  vim.schedule(function()
+    if set.win and not ours(vim.api.nvim_get_current_win()) then set_close() end
+  end)
+end
+
+local function focus_main()
+  if set.win and vim.api.nvim_win_is_valid(set.win) then vim.api.nvim_set_current_win(set.win) end
+end
+
+-- выполнить действие строки под курсором (или зоны под курсором)
+local function activate()
+  if not (set.win and vim.api.nvim_win_is_valid(set.win)) then return end
+  local pos = vim.api.nvim_win_get_cursor(set.win)
+  local item = set.items[pos[1]]
+  if not item then return end
+  for _, z in ipairs(item.zones or {}) do
+    if pos[2] >= z[1] and pos[2] < z[2] then return z[3]() end
+  end
+  if item.act then item.act() end
+end
+
+-- поле ввода поверх строки row (1-based) с экранной колонки col
+-- opts: { name, value, width, on_submit(text), revert_on_esc, complete_path }
+local function make_field(row, col, opts)
+  local f = { name = opts.name }
+  f.buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[f.buf].bufhidden = "wipe"
+  vim.api.nvim_buf_set_lines(f.buf, 0, -1, false, { opts.value or "" })
+  f.win = vim.api.nvim_open_win(f.buf, false, {
+    relative = "win", win = set.win, row = row - 1, col = col,
+    width = opts.width, height = 1, style = "minimal", zindex = 60, focusable = true,
+  })
+  vim.wo[f.win].winhighlight = "Normal:GitDeckField"
+  vim.wo[f.win].wrap = false
+  local function text() return vim.api.nvim_buf_get_lines(f.buf, 0, 1, false)[1] or "" end
+  local o = { buffer = f.buf, silent = true }
+  local function submit()
+    vim.cmd("stopinsert")
+    f.done = true
+    local t = text()
+    vim.schedule(function()
+      focus_main()
+      opts.on_submit(t)
+    end)
+  end
+  local function cancel()
+    vim.cmd("stopinsert")
+    f.done = true
+    if opts.revert_on_esc then
+      set.val[opts.name] = nil
+    else
+      set.val[opts.name] = text()
+    end
+    vim.schedule(function()
+      focus_main()
+      page_repos()
+    end)
+  end
+  vim.keymap.set("n", "<CR>", submit, o)
+  -- в режиме ввода: открыт список дополнения — Enter выбирает вариант, иначе сохраняет
+  vim.keymap.set("i", "<CR>", function()
+    if vim.fn.pumvisible() == 1 then return "<C-y>" end
+    vim.schedule(submit)
+    return ""
+  end, { buffer = f.buf, expr = true })
+  vim.keymap.set({ "i", "n" }, "<Esc>", cancel, o)
+  if opts.complete_path then
+    -- Tab — дополнить путь (список папок/файлов), ещё Tab — следующий вариант
+    vim.keymap.set("i", "<Tab>", function()
+      return vim.fn.pumvisible() == 1 and "<C-n>" or "<C-x><C-f>"
+    end, { buffer = f.buf, expr = true })
+  end
+  -- попали в поле (Enter на строке или клик) → сразу режим ввода, курсор в конец
+  vim.api.nvim_create_autocmd("WinEnter", { buffer = f.buf, callback = function()
+    vim.schedule(function() vim.cmd("startinsert!") end)
+  end })
+  vim.api.nvim_create_autocmd("WinLeave", { buffer = f.buf, callback = function()
+    -- ушёл из поля пути мышью, не нажав Enter, — запомнить набранное
+    if opts.keep_on_leave and not f.done then set.val[opts.name] = text() end
+    f.done = false
+    leave_check()
+  end })
+  set.fields[opts.name] = f
+  return f
+end
+
+local function focus_field(name)
+  local f = set.fields[name]
+  if f and vim.api.nvim_win_is_valid(f.win) then vim.api.nvim_set_current_win(f.win) end
+end
+
+-- нарисовать страницу; fields = { {row, col, opts}, … }
+local function set_draw(title, rows, cursor, fields)
   local lines, hls, width = {}, {}, 44
   set.items = {}
   for i, row in ipairs(rows) do
@@ -436,15 +563,22 @@ local function set_draw(title, rows, cursor)
     set.buf = vim.api.nvim_create_buf(false, true)
     vim.bo[set.buf].bufhidden = "wipe"
     local o = { buffer = set.buf, silent = true, nowait = true }
-    vim.keymap.set("n", "<CR>", function() M._set_action("enter") end, o)
-    vim.keymap.set("n", "a", function() M._set_action("add") end, o)
-    vim.keymap.set("n", "d", function() M._set_action("remove") end, o)
-    vim.keymap.set("n", "<Esc>", function() M._set_action("back") end, o)
+    vim.keymap.set("n", "<CR>", activate, o)
+    -- клик мышью: курсор уже встал на место клика → то же, что Enter
+    vim.keymap.set("n", "<LeftRelease>", function() vim.schedule(activate) end, o)
+    vim.keymap.set("n", "d", function()
+      local item = set.items[vim.api.nvim_win_get_cursor(0)[1]]
+      if item and item.remove then item.remove() end
+    end, o)
+    vim.keymap.set("n", "<Esc>", function()
+      if set.page == "browse" then return page_repos(nil, "add") end
+      if set.page == "repo" then return page_repos(set.repo) end
+      set_close()
+    end, o)
     vim.keymap.set("n", "q", set_close, o)
-    vim.api.nvim_create_autocmd("WinLeave", { buffer = set.buf, callback = function()
-      vim.schedule(function() if not set.asking then set_close() end end)
-    end })
+    vim.api.nvim_create_autocmd("WinLeave", { buffer = set.buf, callback = leave_check })
   end
+  close_fields()
   vim.bo[set.buf].modifiable = true
   vim.api.nvim_buf_set_lines(set.buf, 0, -1, false, lines)
   vim.bo[set.buf].modifiable = false
@@ -461,12 +595,14 @@ local function set_draw(title, rows, cursor)
   }
   if set.win and vim.api.nvim_win_is_valid(set.win) then
     vim.api.nvim_win_set_config(set.win, cfg)
+    vim.api.nvim_set_current_win(set.win)
   else
     set.win = vim.api.nvim_open_win(set.buf, true, cfg)
     vim.wo[set.win].cursorline = true
     vim.wo[set.win].cursorlineopt = "line"
   end
-  -- курсор на первую строку с действием (или на заданную)
+  for _, fd in ipairs(fields or {}) do make_field(fd[1], fd[2], fd[3]) end
+  -- курсор на заданную строку или на первую строку с действием
   local first = cursor
   if not first then
     for i = 1, #lines do if set.items[i] then first = i; break end end
@@ -474,30 +610,158 @@ local function set_draw(title, rows, cursor)
   pcall(vim.api.nvim_win_set_cursor, set.win, { first or 1, 0 })
 end
 
-local function page_repos(cursor_path)
+-- ---------- действия ----------
+local function remove_repo(path)
+  saved.branches[path] = nil
+  for i, p in ipairs(saved.added) do
+    if p == path then table.remove(saved.added, i); break end
+  end
+  saved.removed[path] = true
+  write_saved()
+  st.rows[path] = nil
+  st.list = M.find()
+  render()
+  set.msg = { "Убран: " .. vim.fs.basename(path) .. " (вернуть — «Добавить»)", "DiagnosticWarn" }
+  page_repos()
+end
+
+local function add_repo(input)
+  input = vim.trim(input or "")
+  set.val.path = input
+  if input == "" then
+    set.msg = { "Укажи папку репозитория", "DiagnosticWarn" }
+    return page_repos(nil, "add")
+  end
+  local p = expand(input)
+  if not is_repo(p) then
+    set.msg = { "В этой папке нет git-репозитория", "DiagnosticError" }
+    return page_repos(nil, "add")
+  end
+  saved.removed[p] = nil
+  if not vim.tbl_contains(saved.added, p) then table.insert(saved.added, p) end
+  write_saved()
+  st.list = M.find()
+  recheck(p)
+  set.val.path = nil
+  set.msg = { "Добавлен: " .. vim.fs.basename(p), "DiagnosticOk" }
+  page_repos(p)
+end
+
+local function save_interval(input)
+  input = vim.trim(input or "")
+  local n = tonumber(input)
+  if not (n and n >= 1 and n == math.floor(n)) then
+    set.val.interval = input
+    set.msg = { "Нужно целое число минут, от 1", "DiagnosticError" }
+    return page_repos(nil, "interval")
+  end
+  saved.interval = n
+  write_saved()
+  start_timer()
+  set.val.interval = nil
+  set.msg = { "Проверка каждые " .. n .. " мин", "DiagnosticOk" }
+  page_repos(nil, "interval")
+end
+
+-- ---------- страницы ----------
+-- список репозиториев, добавление, интервал, значки.
+-- cursor_path — репозиторий, на который поставить курсор; at — "add" или "interval"
+page_repos = function(cursor_path, at)
   set.page, set.repo = "repos", nil
-  local rows, cursor = {}, nil
+  local rows, cursor, fields = {}, nil, {}
   local list = st.list or M.find()
   local namew = 11
   for _, p in ipairs(list) do namew = math.max(namew, vim.fn.strdisplaywidth(vim.fs.basename(p))) end
-  table.insert(rows, { "  " .. fit("Репозиторий", namew) .. "  отслеживаемая ветка", "Comment" })
-  for _, p in ipairs(list) do
+
+  -- строки репозиториев: имя, ветка, справа кнопка ✕ (убрать из отслеживаемых)
+  local texts, widest = {}, 0
+  for i, p in ipairs(list) do
     local br = M.tracked(p) or "…"
     local cur = st.rows[p] and st.rows[p].branch
     local text = "  " .. fit(vim.fs.basename(p), namew) .. "  " .. br
-    local segs = nil
+    local segs = {}
     if br == cur then
-      segs = { { #text, #text + #" (текущая)", "Comment" } }
+      table.insert(segs, { #text, #text + #" (текущая)", "Comment" })
       text = text .. " (текущая)"
     end
-    table.insert(rows, { text, nil, { repo = p }, segs })
+    texts[i] = { text, segs }
+    widest = math.max(widest, vim.fn.strdisplaywidth(text))
+  end
+  table.insert(rows, { "  " .. fit("Репозиторий", namew) .. "  отслеживаемая ветка", "Comment" })
+  for i, p in ipairs(list) do
+    local text, segs = texts[i][1], texts[i][2]
+    text = text .. string.rep(" ", widest - vim.fn.strdisplaywidth(text) + 3)
+    local xs = #text
+    text = text .. "✕"
+    table.insert(segs, { xs, #text, "DiagnosticError" })
+    local function rm() remove_repo(p) end
+    table.insert(rows, { text, nil, {
+      act = function() page_repo(p) end,
+      remove = rm,
+      zones = { { xs - 1, #text, rm } },
+    }, segs })
     if p == cursor_path then cursor = #rows end
   end
+  if #list == 0 then table.insert(rows, { "  (пока нет репозиториев)", "Comment" }) end
+
+  -- добавить репозиторий: поле ввода, 📁 — выбрать папку мышью, [ Добавить ]
   table.insert(rows, { "" })
-  table.insert(rows, { "  + Добавить репозиторий", "DiagnosticOk", { add = true } })
-  table.insert(rows, { "  ⏱ Проверять каждые: " .. interval() .. " мин", nil, { interval = true } })
+  table.insert(rows, { " Добавить репозиторий", "Title" })
+  local fw = math.max(30, widest - 10)
+  local pre = "  "
+  local text = pre .. string.rep(" ", fw) .. "  "
+  local fs, fe = #pre, #pre + fw
+  local bs = #text
+  text = text .. "📁"
+  local be = #text
+  text = text .. "  "
+  local as = #text
+  text = text .. "[ Добавить ]"
+  local ae = #text
+  local path_row = #rows + 1
+  table.insert(rows, { text, nil, {
+    act = function() focus_field("path") end,
+    zones = {
+      { fs, fe, function() focus_field("path") end },
+      { bs, be, function() page_browse() end },
+      { as, ae, function()
+        local f = set.fields.path
+        add_repo(f and vim.api.nvim_buf_get_lines(f.buf, 0, 1, false)[1] or set.val.path)
+      end },
+    },
+  }, { { as, ae, "DiagnosticOk" } } })
+  table.insert(fields, { path_row, vim.fn.strdisplaywidth(pre), {
+    name = "path", width = fw, complete_path = true, keep_on_leave = true,
+    value = set.val.path or (expand("~/Documents/Projects") .. "/"),
+    on_submit = add_repo,
+  } })
+  if at == "add" then cursor = path_row end
+
+  -- интервал проверки
   table.insert(rows, { "" })
-  table.insert(rows, { " Enter выбрать · a добавить · d убрать · q закрыть", "Comment" })
+  local ipre = "  ⏱ Проверять каждые "
+  local iw = 5
+  local itext = ipre .. string.rep(" ", iw) .. " мин"
+  local int_row = #rows + 1
+  table.insert(rows, { itext, nil, {
+    act = function() focus_field("interval") end,
+  } })
+  table.insert(fields, { int_row, vim.fn.strdisplaywidth(ipre), {
+    name = "interval", width = iw, revert_on_esc = true,
+    value = set.val.interval or tostring(interval()),
+    on_submit = save_interval,
+  } })
+  if at == "interval" then cursor = int_row end
+
+  -- сообщение о последнем действии
+  if set.msg then
+    table.insert(rows, { "" })
+    table.insert(rows, { "  " .. set.msg[1], set.msg[2] })
+  end
+
+  table.insert(rows, { "" })
+  table.insert(rows, { " Enter или клик — выбрать · ✕ или d — убрать · q закрыть", "Comment" })
+  table.insert(rows, { " В поле: Enter — сохранить, Esc — выйти, Tab — дополнить путь", "Comment" })
   table.insert(rows, { "" })
   table.insert(rows, { " Значки", "Title" })
   for _, l in ipairs({
@@ -513,19 +777,14 @@ local function page_repos(cursor_path)
   }) do
     table.insert(rows, { "  " .. l[1] .. "  " .. l[3], nil, nil, { { 2, 2 + #l[1], l[2] } } })
   end
-  set_draw("GitDeck · настройки", rows, cursor)
+  set_draw("GitDeck · настройки", rows, cursor, fields)
 end
 
-local function current_branch(path)
-  local res = vim.system({ "git", "branch", "--show-current" }, { cwd = path, text = true }):wait()
-  local b = vim.trim(res.stdout or "")
-  return b ~= "" and b or nil
-end
-
-local function page_repo(path)
+-- ветки репозитория: ● — отслеживаемая (пока не выбрана — открытая сейчас),
+-- (текущая) — открытая в репозитории сейчас
+page_repo = function(path)
   set.page, set.repo = "repo", path
-  -- ● — отслеживаемая ветка (пока не выбрана — открытая сейчас),
-  -- (текущая) — ветка, открытая в репозитории сейчас
+  set.msg = nil
   local cur = current_branch(path)
   local chosen = saved.branches[path] or cur
   local rows, cursor = {}, nil
@@ -537,103 +796,81 @@ local function page_repo(path)
       segs = { { #text, #text + #" (текущая)", "Comment" } }
       text = text .. " (текущая)"
     end
-    table.insert(rows, { text, nil, { branch = b }, segs })
+    table.insert(rows, { text, nil, { act = function()
+      saved.branches[path] = b
+      write_saved()
+      recheck(path)
+      page_repos(path)
+    end }, segs })
     if chosen == b then cursor = #rows end
   end
   table.insert(rows, { "" })
-  table.insert(rows, { "  − Убрать из отслеживаемых", "DiagnosticError", { remove = true } })
-  table.insert(rows, { "" })
-  table.insert(rows, { " Enter выбрать · Esc назад · q закрыть", "Comment" })
+  table.insert(rows, { " Enter или клик — выбрать · Esc назад · q закрыть", "Comment" })
   set_draw(vim.fs.basename(path), rows, cursor)
 end
 
-local function remove_repo(path)
-  saved.branches[path] = nil
-  for i, p in ipairs(saved.added) do
-    if p == path then table.remove(saved.added, i); break end
+-- выбор папки мышью: клик по папке — зайти, «..» — выше, [ Выбрать эту папку ]
+page_browse = function(dir)
+  if not dir then
+    local v = set.val.path
+    local f = set.fields.path
+    if f and vim.api.nvim_buf_is_valid(f.buf) then v = vim.api.nvim_buf_get_lines(f.buf, 0, 1, false)[1] end
+    dir = v and v ~= "" and expand(v) or expand("~/Documents/Projects")
+    if vim.fn.isdirectory(dir) ~= 1 then dir = expand("~") end
+    set.val.path = v
   end
-  saved.removed[path] = true
-  write_saved()
-  st.rows[path] = nil
-  st.list = M.find()
-  render()
-  vim.notify("GitDeck: убран " .. path .. " (вернуть — «Добавить репозиторий»)")
-  page_repos()
-end
-
-local function add_repo()
-  set.asking = true
-  vim.ui.input({ prompt = "Папка репозитория: ", default = expand("~/Documents/Projects") .. "/", completion = "dir" },
-    function(input)
-      set.asking = false
-      vim.schedule(function()
-        if not input or vim.trim(input) == "" then return page_repos() end
-        local p = expand(vim.trim(input))
-        if not is_repo(p) then
-          vim.notify("GitDeck: в папке нет git-репозитория: " .. p, vim.log.levels.WARN)
-          return page_repos()
-        end
-        saved.removed[p] = nil
-        if not vim.tbl_contains(saved.added, p) then table.insert(saved.added, p) end
-        write_saved()
-        st.list = M.find()
-        recheck(p)
-        page_repos(p)
-      end)
-    end)
-end
-
--- как часто проверять репозитории (минуты, целое от 1)
-set_interval = function()
-  set.asking = true
-  vim.ui.input({ prompt = "Проверять каждые (минут): ", default = tostring(interval()) }, function(input)
-    set.asking = false
-    vim.schedule(function()
-      local n = tonumber(input and vim.trim(input) or "")
-      if input and vim.trim(input) ~= "" and not (n and n >= 1 and n == math.floor(n)) then
-        vim.notify("GitDeck: нужно целое число минут, от 1", vim.log.levels.WARN)
-      elseif n then
-        saved.interval = n
-        write_saved()
-        start_timer()
-        vim.notify("GitDeck: проверка каждые " .. n .. " мин")
-      end
-      local line = vim.api.nvim_win_is_valid(set.win or -1) and vim.api.nvim_win_get_cursor(set.win)[1]
-      page_repos()
-      if line then pcall(vim.api.nvim_win_set_cursor, set.win, { line, 0 }) end
-    end)
-  end)
-end
-
-function M._set_action(kind)
-  local item = set.items[vim.api.nvim_win_get_cursor(0)[1]]
-  if kind == "back" then
-    if set.page == "repo" then return page_repos(set.repo) end
-    return set_close()
+  set.page, set.dir = "browse", dir
+  local rows = {}
+  local home = expand("~")
+  local shown = dir:sub(1, #home) == home and ("~" .. dir:sub(#home + 1)) or dir
+  table.insert(rows, { " " .. (shown == "" and "/" or shown), "Title" })
+  if is_repo(dir) then table.insert(rows, { "  это git-репозиторий — можно выбрать", "DiagnosticOk" }) end
+  table.insert(rows, { "" })
+  local parent = vim.fs.dirname(dir)
+  if parent ~= dir then
+    table.insert(rows, { "  ⬆ ..", "Directory", { act = function() page_browse(parent) end } })
   end
-  if kind == "add" then return add_repo() end
-  if kind == "remove" then
-    local p = (item and item.repo) or (set.page == "repo" and set.repo)
-    if p then remove_repo(p) end
-    return
+  local names = {}
+  for name, t in vim.fs.dir(dir) do
+    if (t == "directory" or t == "link") and name:sub(1, 1) ~= "."
+      and vim.fn.isdirectory(vim.fs.joinpath(dir, name)) == 1 then
+      table.insert(names, name)
+    end
   end
-  -- enter
-  if not item then return end
-  if item.add then return add_repo() end
-  if item.interval then return set_interval() end
-  if item.remove then return remove_repo(set.repo) end
-  if item.repo then return page_repo(item.repo) end
-  if item.branch ~= nil then
-    saved.branches[set.repo] = item.branch
-    write_saved()
-    recheck(set.repo)
-    page_repos(set.repo)
+  table.sort(names, function(a, b) return a:lower() < b:lower() end)
+  for _, name in ipairs(names) do
+    local p = vim.fs.joinpath(dir, name)
+    local text = "  📁 " .. name
+    local segs = nil
+    if is_repo(p) then
+      segs = { { #text, #text + #"  git", "DiagnosticOk" } }
+      text = text .. "  git"
+    end
+    table.insert(rows, { text, nil, { act = function() page_browse(p) end }, segs })
   end
+  if #names == 0 then table.insert(rows, { "  (нет папок)", "Comment" }) end
+  table.insert(rows, { "" })
+  local text = "  [ Выбрать эту папку ]"
+  local ce = #text
+  text = text .. "   [ Отмена ]"
+  local function choose()
+    set.val.path = dir
+    page_repos(nil, "add")
+  end
+  local function cancel() page_repos(nil, "add") end
+  table.insert(rows, { text, nil, {
+    act = choose,
+    zones = { { 2, ce, choose }, { ce + 3, #text, cancel } },
+  }, { { 2, ce, "DiagnosticOk" }, { ce + 3, #text, "Comment" } } })
+  table.insert(rows, { "" })
+  table.insert(rows, { " Enter или клик — открыть папку · Esc назад", "Comment" })
+  set_draw("Выбор папки", rows, 4)
 end
 
 -- открыть настройки (список); курсор — на репозитории path, если он задан
 function M.settings(path)
   ensure_init()
+  set.msg, set.val = nil, {}
   page_repos(path)
 end
 
