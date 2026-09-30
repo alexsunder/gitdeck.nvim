@@ -428,7 +428,26 @@ local set = {
 }
 local page_repos, page_repo, page_browse -- объявлены ниже
 
-vim.api.nvim_set_hl(0, "GitDeckField", { default = true, link = "Visual" })
+-- цвет полей ввода: фон окна настроек, чуть темнее (подходит к любой теме).
+-- Свой цвет: highlight GitDeckField guibg=… в init.vim после colorscheme
+local function field_hl()
+  if vim.fn.hlexists("GitDeckField") == 1 and not set.auto_hl then
+    local cur = vim.api.nvim_get_hl(0, { name = "GitDeckField" })
+    if next(cur) then return end
+  end
+  local bg
+  for _, g in ipairs({ "NormalFloat", "Normal" }) do
+    bg = vim.api.nvim_get_hl(0, { name = g, link = false }).bg
+    if bg then break end
+  end
+  if not bg then
+    vim.api.nvim_set_hl(0, "GitDeckField", { link = "CursorLine" })
+  else
+    local function ch(shift) return math.floor(bit.band(bit.rshift(bg, shift), 0xff) * 0.72) end
+    vim.api.nvim_set_hl(0, "GitDeckField", { bg = ch(16) * 65536 + ch(8) * 256 + ch(0) })
+  end
+  set.auto_hl = true
+end
 
 local function ours(win)
   if win == set.win then return true end
@@ -486,7 +505,23 @@ local function make_field(row, col, opts)
     relative = "win", win = set.win, row = row - 1, col = col,
     width = opts.width, height = 1, style = "minimal", zindex = 60, focusable = true,
   })
-  vim.wo[f.win].winhighlight = "Normal:GitDeckField"
+  -- поле: свой фон и отступ в 1 знак слева (через колонку складок)
+  vim.wo[f.win].winhighlight = "Normal:GitDeckField,FoldColumn:GitDeckField,EndOfBuffer:GitDeckField"
+  vim.wo[f.win].foldcolumn = "1"
+  vim.wo[f.win].fillchars = "fold: ,foldopen: ,foldclose: ,foldsep: ,eob: "
+  -- подсказка в пустом поле (исчезает, когда начинаешь печатать)
+  if opts.placeholder then
+    local pns = vim.api.nvim_create_namespace("gitdeck_placeholder")
+    local function upd()
+      vim.api.nvim_buf_clear_namespace(f.buf, pns, 0, -1)
+      if (vim.api.nvim_buf_get_lines(f.buf, 0, 1, false)[1] or "") == "" then
+        vim.api.nvim_buf_set_extmark(f.buf, pns, 0, 0,
+          { virt_text = { { opts.placeholder, "Comment" } }, virt_text_pos = "overlay" })
+      end
+    end
+    upd()
+    vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, { buffer = f.buf, callback = upd })
+  end
   vim.wo[f.win].wrap = false
   local function text() return vim.api.nvim_buf_get_lines(f.buf, 0, 1, false)[1] or "" end
   local o = { buffer = f.buf, silent = true }
@@ -513,6 +548,27 @@ local function make_field(row, col, opts)
     end)
   end
   vim.keymap.set("n", "<CR>", submit, o)
+  -- клик мышью, пока идёт ввод: nvim иногда оставляет фокус в поле, даже если
+  -- кликнули рядом (📁, [ Добавить ]) — поэтому переходим туда, куда кликнули, сами
+  vim.keymap.set({ "n", "i" }, "<LeftMouse>", function()
+    local m = vim.fn.getmousepos()
+    if m.winid == 0 then return end
+    if m.winid == f.win then
+      pcall(vim.api.nvim_win_set_cursor, f.win, { 1, math.max(0, m.wincol - 2) })
+      return
+    end
+    vim.cmd("stopinsert")
+    if opts.revert_on_esc then
+      set.val[opts.name] = nil
+      vim.api.nvim_buf_set_lines(f.buf, 0, -1, false, { opts.value or "" })
+    end
+    vim.api.nvim_set_current_win(m.winid)
+    local buf = vim.api.nvim_win_get_buf(m.winid)
+    local line = math.max(1, math.min(m.line, vim.api.nvim_buf_line_count(buf)))
+    pcall(vim.api.nvim_win_set_cursor, m.winid, { line, math.max(0, m.column - 1) })
+    -- выход из режима ввода сдвинет курсор на знак влево — запомнить место клика
+    set.click = { line, math.max(0, m.column - 1) }
+  end, o)
   -- в режиме ввода: открыт список дополнения — Enter выбирает вариант, иначе сохраняет
   vim.keymap.set("i", "<CR>", function()
     if vim.fn.pumvisible() == 1 then return "<C-y>" end
@@ -533,6 +589,11 @@ local function make_field(row, col, opts)
   vim.api.nvim_create_autocmd("WinLeave", { buffer = f.buf, callback = function()
     -- ушёл из поля пути мышью, не нажав Enter, — запомнить набранное
     if opts.keep_on_leave and not f.done then set.val[opts.name] = text() end
+    -- интервал: ушёл без Enter — вернуть сохранённое значение
+    if opts.revert_on_esc and not f.done then
+      set.val[opts.name] = nil
+      vim.api.nvim_buf_set_lines(f.buf, 0, -1, false, { opts.value or "" })
+    end
     f.done = false
     leave_check()
   end })
@@ -565,7 +626,17 @@ local function set_draw(title, rows, cursor, fields)
     local o = { buffer = set.buf, silent = true, nowait = true }
     vim.keymap.set("n", "<CR>", activate, o)
     -- клик мышью: курсор уже встал на место клика → то же, что Enter
-    vim.keymap.set("n", "<LeftRelease>", function() vim.schedule(activate) end, o)
+    -- (из поля ввода клик приходит в режиме ввода — сначала выйти из него)
+    vim.keymap.set({ "n", "i" }, "<LeftRelease>", function()
+      vim.cmd("stopinsert")
+      vim.schedule(function()
+        if set.click and set.win and vim.api.nvim_win_is_valid(set.win) then
+          pcall(vim.api.nvim_win_set_cursor, set.win, set.click)
+        end
+        set.click = nil
+        activate()
+      end)
+    end, o)
     vim.keymap.set("n", "d", function()
       local item = set.items[vim.api.nvim_win_get_cursor(0)[1]]
       if item and item.remove then item.remove() end
@@ -577,6 +648,10 @@ local function set_draw(title, rows, cursor, fields)
     end, o)
     vim.keymap.set("n", "q", set_close, o)
     vim.api.nvim_create_autocmd("WinLeave", { buffer = set.buf, callback = leave_check })
+    -- вернулись в окно из поля ввода (кликом) — обычный режим, чтобы работали q, Enter, d
+    vim.api.nvim_create_autocmd("WinEnter", { buffer = set.buf, callback = function()
+      vim.cmd("stopinsert")
+    end })
   end
   close_fields()
   vim.bo[set.buf].modifiable = true
@@ -732,7 +807,7 @@ page_repos = function(cursor_path, at)
   }, { { as, ae, "DiagnosticOk" } } })
   table.insert(fields, { path_row, vim.fn.strdisplaywidth(pre), {
     name = "path", width = fw, complete_path = true, keep_on_leave = true,
-    value = set.val.path or (expand("~/Documents/Projects") .. "/"),
+    value = set.val.path or "", placeholder = "путь к папке",
     on_submit = add_repo,
   } })
   if at == "add" then cursor = path_row end
@@ -871,6 +946,7 @@ end
 function M.settings(path)
   ensure_init()
   set.msg, set.val = nil, {}
+  field_hl()
   page_repos(path)
 end
 
