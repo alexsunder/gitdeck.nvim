@@ -482,9 +482,15 @@ local function page_repos(cursor_path)
   for _, p in ipairs(list) do namew = math.max(namew, vim.fn.strdisplaywidth(vim.fs.basename(p))) end
   table.insert(rows, { "  " .. fit("Репозиторий", namew) .. "  отслеживаемая ветка", "Comment" })
   for _, p in ipairs(list) do
-    local br = saved.branches[p] and saved.branches[p]
-      or ("текущая" .. (M.tracked(p) and (": " .. M.tracked(p)) or ""))
-    table.insert(rows, { "  " .. fit(vim.fs.basename(p), namew) .. "  " .. br, nil, { repo = p } })
+    local br = M.tracked(p) or "…"
+    local cur = st.rows[p] and st.rows[p].branch
+    local text = "  " .. fit(vim.fs.basename(p), namew) .. "  " .. br
+    local segs = nil
+    if br == cur then
+      segs = { { #text, #text + #" (текущая)", "Comment" } }
+      text = text .. " (текущая)"
+    end
+    table.insert(rows, { text, nil, { repo = p }, segs })
     if p == cursor_path then cursor = #rows end
   end
   table.insert(rows, { "" })
@@ -510,17 +516,28 @@ local function page_repos(cursor_path)
   set_draw("GitDeck · настройки", rows, cursor)
 end
 
+local function current_branch(path)
+  local res = vim.system({ "git", "branch", "--show-current" }, { cwd = path, text = true }):wait()
+  local b = vim.trim(res.stdout or "")
+  return b ~= "" and b or nil
+end
+
 local function page_repo(path)
   set.page, set.repo = "repo", path
-  local cur = st.rows[path] and st.rows[path].branch
-  local chosen = saved.branches[path]
+  -- ● — отслеживаемая ветка (пока не выбрана — открытая сейчас),
+  -- (текущая) — ветка, открытая в репозитории сейчас
+  local cur = current_branch(path)
+  local chosen = saved.branches[path] or cur
   local rows, cursor = {}, nil
   table.insert(rows, { " Какую ветку отслеживать:", "Comment" })
-  table.insert(rows, { (chosen and "  ○ " or "  ● ") .. "текущая" .. (cur and cur ~= "?" and (" (сейчас " .. cur .. ")") or ""),
-    nil, { branch = false } })
-  if not chosen then cursor = #rows end
   for _, b in ipairs(branches(path)) do
-    table.insert(rows, { (chosen == b and "  ● " or "  ○ ") .. b, nil, { branch = b } })
+    local text = (chosen == b and "  ● " or "  ○ ") .. b
+    local segs = nil
+    if b == cur then
+      segs = { { #text, #text + #" (текущая)", "Comment" } }
+      text = text .. " (текущая)"
+    end
+    table.insert(rows, { text, nil, { branch = b }, segs })
     if chosen == b then cursor = #rows end
   end
   table.insert(rows, { "" })
@@ -607,7 +624,7 @@ function M._set_action(kind)
   if item.remove then return remove_repo(set.repo) end
   if item.repo then return page_repo(item.repo) end
   if item.branch ~= nil then
-    saved.branches[set.repo] = item.branch or nil
+    saved.branches[set.repo] = item.branch
     write_saved()
     recheck(set.repo)
     page_repos(set.repo)
